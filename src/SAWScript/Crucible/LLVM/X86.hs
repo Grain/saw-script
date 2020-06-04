@@ -29,11 +29,10 @@ module SAWScript.Crucible.LLVM.X86
 import Control.Lens.TH (makeLenses)
 
 import System.IO (stdout)
-import Control.Exception (catch, throw)
 import Control.Lens (view, use, (&), (^.), (.~), (.=))
 import Control.Monad.ST (stToIO)
 import Control.Monad.State
-import Control.Monad.Catch (MonadThrow)
+import Control.Monad.Catch (MonadThrow, throwM)
 
 import Data.Foldable (foldlM)
 import Data.IORef
@@ -54,10 +53,11 @@ import Data.Parameterized.Context hiding (view)
 import Data.Parameterized.Nonce
 
 import Verifier.SAW.Recognizer
-import Verifier.SAW.Term.Functor
+import Verifier.SAW.SharedTerm
 import Verifier.SAW.TypedTerm
+import Verifier.SAW.FiniteValue (ppFirstOrderValue)
 
-import SAWScript.Prover.SBV
+import SAWScript.Proof
 import SAWScript.Prover.SolverStats
 import SAWScript.TopLevel
 import SAWScript.Value
@@ -150,7 +150,7 @@ runX86Sim :: X86State -> X86Sim a -> IO (a, X86State)
 runX86Sim st m = runStateT (unX86Sim m) st
 
 throwX86 :: MonadThrow m => String -> m a
-throwX86 = throw . X86Error
+throwX86 = throwM . X86Error
 
 setReg ::
   (MonadIO m, MonadThrow m) =>
@@ -184,10 +184,12 @@ crucible_llvm_verify_x86 ::
   FilePath {- ^ Path to ELF file -} ->
   String {- ^ Function's symbol in ELF file -} ->
   [(String, Integer)] {- ^ Global variable symbol names and sizes (in bytes) -} ->
-  Bool {-^ Whether to enable path satisfiability checking (currently ignored) -} ->
+  Bool {- ^ Whether to enable path satisfiability checking (currently ignored) -} ->
   LLVMCrucibleSetupM () {- ^ Specification to verify against -} ->
+  ProofScript SatResult {- ^ Proof script to use when discharging goals -} ->
   TopLevel (SomeLLVM MS.CrucibleMethodSpecIR)
-crucible_llvm_verify_x86 bic opts (Some (llvmModule :: LLVMModule x)) path nm globsyms _checkSat setup
+crucible_llvm_verify_x86
+  bic opts (Some (llvmModule :: LLVMModule x)) path nm globsyms _checkSat setup tactic
   | Just Refl <- testEquality (C.LLVM.X86Repr $ knownNat @64) . C.LLVM.llvmArch
                  $ modTrans llvmModule ^. C.LLVM.transContext = do
       let ?ptrWidth = knownNat @64
@@ -278,7 +280,8 @@ crucible_llvm_verify_x86 bic opts (Some (llvmModule :: LLVMModule x)) path nm gl
         C.AbortedResult{} -> printOutLn opts Warn "Warning: function never returns"
         C.TimeoutResult{} -> fail "Execution timed out"
 
-      liftIO . void $ runX86Sim preState checkGoals
+      proxy <- getProxy
+      checkGoals sym opts sc proxy tactic
  
       pure $ SomeLLVM methodSpec
   | otherwise = fail "LLVM module must be 64-bit"
@@ -699,29 +702,36 @@ assertPointsTo env tyenv nameEnv (LLVMPointsTo _ cond tptr texpected) = do
 
 -- | Gather and run the solver on goals from the simulator.
 checkGoals ::
-  X86Sim ()
-checkGoals = do
-  sym <- use x86Sym
-  opts <- use x86Options
-  sc <- use x86SharedContext
+  Sym ->
+  Options ->
+  SharedContext ->
+  AIGProxy ->
+  ProofScript SatResult ->
+  TopLevel ()
+checkGoals sym opts sc (AIGProxy _proxy) tactic = do
   gs <- liftIO $ getGoals sym
   liftIO . printOutLn opts Info $ mconcat
     [ "Simulation finished, running solver on "
     , show $ length gs
     , " goals"
     ]
-  liftIO . forM_ gs $ \g ->
-    do
-      term <- gGoal sc g
-      (mb, stats) <- proveUnintSBV z3 [] Nothing sc term
-      printOutLn opts Info $ ppStats stats
-      case mb of
-        Nothing -> printOutLn opts Info "Goal succeeded"
-        Just ex -> do
-          fail $ mconcat
-            ["Failure (", show $ gLoc g
-            , "): ", show $ gMessage g
-            , "\nCounterexample: " <> show ex
-            ]
-    `catch` \(X86Error e) -> fail $ "Failure, error: " <> e
+  forM_ (zip [0..] gs) $ \(n, g) -> do
+    term <- liftIO $ gGoal sc g
+    let proofgoal = ProofGoal n "vc" (show $ gMessage g) term
+    r <- evalStateT tactic $ startProof proofgoal
+    case r of
+      Unsat stats -> do
+        liftIO . printOutLn opts Info $ ppStats stats
+      SatMulti stats vals -> do
+        printOutLnTop Info $ unwords ["Subgoal failed:", show $ gMessage g]
+        printOutLnTop Info (show stats)
+        printOutLnTop OnlyCounterExamples "----------Counterexample----------"
+        ppOpts <- sawPPOpts <$> rwPPOpts <$> getTopLevelRW
+        case vals of
+          [] -> printOutLnTop OnlyCounterExamples "<<All settings of the symbolic variables constitute a counterexample>>"
+          _ -> let showAssignment (name, val) =
+                     mconcat [ " ", name, ": ", show $ ppFirstOrderValue ppOpts val ]
+               in mapM_ (printOutLnTop OnlyCounterExamples . showAssignment) vals
+        printOutLnTop OnlyCounterExamples "----------------------------------"
+        throwTopLevel "Proof failed."
   liftIO $ printOutLn opts Info "All goals succeeded"
